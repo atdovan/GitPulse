@@ -25,7 +25,7 @@
               <line x1="12" y1="16" x2="12" y2="12"></line>
               <line x1="12" y1="8" x2="12.01" y2="8"></line>
             </svg>
-            <span class="tooltip">Token is only required for private repositories. For public repositories, you can leave this empty.</span>
+            <span class="tooltip">Token is only required for private repositories.</span>
           </div>
         </div>
         <button type="submit" disabled={isAnalyzing}>
@@ -57,47 +57,55 @@
             </div>
           </div>
 
-          <div class="analysis-section code-breakthrough">
-            <h3>Code Analysis Breakthrough</h3>
-            {#each analysis.fileAnalyses as fileAnalysis (fileAnalysis.path)}
-              <div class="file-analysis">
-                <button class="dropdown-toggle" on:click={() => (fileAnalysis.open = !fileAnalysis.open)}>
-                  {fileAnalysis.path} {fileAnalysis.open ? '▼' : '▶'}
-                </button>
-                {#if fileAnalysis.open}
-                  <div class="analysis-details">
-                    <h4>Analysis for {fileAnalysis.path}</h4>
-                    <ul>
-                      <li><strong>Good:</strong>
-                        <ul>
-                          {#each fileAnalysis.good as point}
-                            <li>{point}</li>
-                          {/each}
-                        </ul>
-                      </li>
-                      <li><strong>Bad:</strong>
-                        <ul>
-                          {#each fileAnalysis.bad as point}
-                            <li>{point}</li>
-                          {/each}
-                        </ul>
-                      </li>
-                      <li><strong>Improvements:</strong>
-                        <ul>
-                          {#each fileAnalysis.improvements as point}
-                            <li>{point}</li>
-                          {/each}
-                        </ul>
-                      </li>
-                    </ul>
-                    <button class="deep-analysis-btn" on:click={() => deepAnalyze(fileAnalysis.path)}>
-                      Continue Deeper Analysis
-                    </button>
-                  </div>
-                {/if}
-              </div>
-            {/each}
-          </div>
+          {#if analysis.status === 'pending'}
+            <div class="loading">Performing code analysis...</div>
+          {:else if analysis.status === 'completed' && analysis.fileAnalyses.length > 0}
+            <div class="analysis-section code-breakthrough">
+              <h3>Code Analysis Breakthrough</h3>
+              {#each analysis.fileAnalyses as fileAnalysis (fileAnalysis.path)}
+                <div class="file-analysis">
+                  <button class="dropdown-toggle" on:click={() => (fileAnalysis.open = !fileAnalysis.open)}>
+                    {fileAnalysis.path} {fileAnalysis.open ? '▼' : '▶'}
+                  </button>
+                  {#if fileAnalysis.open}
+                    <div class="analysis-details">
+                      <h4>Analysis for {fileAnalysis.path}</h4>
+                      <ul>
+                        <li><strong>Good:</strong>
+                          <ul>
+                            {#each fileAnalysis.good as point}
+                              <li>{point}</li>
+                            {/each}
+                          </ul>
+                        </li>
+                        <li><strong>Bad:</strong>
+                          <ul>
+                            {#each fileAnalysis.bad as point}
+                              <li>{point}</li>
+                            {/each}
+                          </ul>
+                        </li>
+                        <li><strong>Improvements:</strong>
+                          <ul>
+                            {#each fileAnalysis.improvements as point}
+                              <li>{point}</li>
+                            {/each}
+                          </ul>
+                        </li>
+                      </ul>
+                      {#if fileAnalysis.deepAnalysisPending}
+                        <button class="deep-analysis-btn" on:click={() => deepAnalyze(fileAnalysis.path)}>
+                          Continue Deeper Analysis
+                        </button>
+                      {/if}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {:else if analysis.status === 'failed'}
+            <div class="error">Code analysis failed. Please try again later.</div>
+          {/if}
         {:else}
           <p>Enter a GitHub repository URL to begin analysis</p>
         {/if}
@@ -107,6 +115,8 @@
 </div>
 
 <script lang="ts">
+  import { onDestroy } from 'svelte';
+
   interface Analysis {
     basicInfo: {
       name: string;
@@ -123,10 +133,11 @@
       bad: string[];
       improvements: string[];
       deepAnalysisPending: boolean;
-      open?: boolean; // For dropdown toggle
+      open?: boolean;
     }[];
     suggestions: string[];
     vulnerabilities: string[];
+    status: 'pending' | 'completed' | 'failed';
   }
 
   let repoUrl = '';
@@ -134,45 +145,100 @@
   let isAnalyzing = false;
   let error: string | null = null;
   let analysis: Analysis | null = null;
+  let pollingInterval: NodeJS.Timeout | null = null;
 
   async function analyzeRepo() {
     isAnalyzing = true;
     error = null;
     analysis = null;
+    if (pollingInterval) clearInterval(pollingInterval);
 
     try {
+      console.log('Sending request to /api/analyze:', { repoUrl, token: githubToken });
       const response = await fetch('/api/analyze', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoUrl, token: githubToken || undefined }),
       });
+      console.log('Response status:', response.status);
 
-      const result = await response.json();
+      const text = await response.text(); // Get raw text first
+      console.log('Raw response:', text);
 
+      const result = JSON.parse(text); // Parse JSON
       if (!response.ok) {
-        throw new Error(result.error || 'Failed to analyze repository');
+        throw new Error(result.error || `Server returned ${response.status}`);
       }
 
       analysis = result as Analysis;
-      analysis.fileAnalyses.forEach(file => file.open = false); // Initialize dropdowns as closed
-    } catch (e) {
-      if (e instanceof Error) {
-        error = e.message;
-      } else {
-        error = 'An unknown error occurred';
+      analysis.fileAnalyses.forEach(file => (file.open = false));
+
+      if (analysis.status === 'pending') {
+        pollingInterval = setInterval(checkAnalysisStatus, 2000);
       }
+    } catch (e) {
+      console.error('Fetch error:', e);
+      error = e instanceof Error ? e.message : 'An unknown error occurred';
     } finally {
-      isAnalyzing = false;
+      isAnalyzing = false; // Ensure this runs even on error
+      console.log('Analysis complete, isAnalyzing:', isAnalyzing);
+    }
+  }
+
+  async function checkAnalysisStatus() {
+    if (!repoUrl || !analysis || analysis.status !== 'pending') return;
+
+    try {
+      console.log('Polling /api/analyze/status...');
+      const response = await fetch('/api/analyze/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoUrl }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Status check failed');
+
+      analysis = result as Analysis;
+      analysis.fileAnalyses.forEach(file => (file.open = file.open || false));
+
+      if (analysis.status !== 'pending' && pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = null;
+        console.log('Polling stopped');
+      }
+    } catch (e) {
+      console.error('Status check error:', e);
+      error = e instanceof Error ? e.message : 'Status check failed';
     }
   }
 
   async function deepAnalyze(filePath: string) {
-    // Placeholder for deeper analysis (e.g., more detailed OpenAI call)
-    console.log(`Starting deeper analysis for ${filePath}`);
-    // Implement deeper analysis logic here, e.g., fetch file content again and send to OpenAI with a more detailed prompt
+    if (!analysis) return;
+    const file = analysis.fileAnalyses.find(f => f.path === filePath);
+    if (!file || !file.deepAnalysisPending) return;
+
+    try {
+      const response = await fetch('/api/analyze/deep', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoUrl, token: githubToken, filePath }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Deep analysis failed');
+
+      file.good = result.good || file.good;
+      file.bad = result.bad || file.bad;
+      file.improvements = result.improvements || file.improvements;
+      file.deepAnalysisPending = false;
+    } catch (e) {
+      console.error('Deep analysis error:', e);
+      error = e instanceof Error ? e.message : 'Deep analysis failed';
+    }
   }
+
+  onDestroy(() => {
+    if (pollingInterval) clearInterval(pollingInterval);
+  });
 </script>
 
 <style>
